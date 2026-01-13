@@ -16,7 +16,6 @@ mimic joints cannot be parsed correctly. Use the URDF parser (:class:`~UrdfKinem
 for more complex robots.
 """
 
-
 # Standard Library
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +28,7 @@ from curobo.cuda_robot_model.types import JointType
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.util.logger import log_error
+from pxr import Gf
 
 try:
     # Third Party
@@ -89,7 +89,10 @@ class UsdKinematicsParser(KinematicsParser):
         all_joints = [
             x
             for x in self._stage.Traverse()
-            if (x.IsA(UsdPhysics.Joint) and str(x.GetPath()).startswith(self._usd_robot_root))
+            if (
+                x.IsA(UsdPhysics.Joint)
+                and str(x.GetPath()).startswith(self._usd_robot_root)
+            )
         ]
         for l in all_joints:
             parent, child = get_links_for_joint(l)
@@ -100,22 +103,16 @@ class UsdKinematicsParser(KinematicsParser):
     def get_link_parameters(self, link_name: str, base: bool = False) -> LinkParams:
         """Get Link parameters from usd stage.
 
-        USD kinematics "X" axis joints map to "Z" in URDF. Specifically,
-        uniform token physics:axis = "X" value only matches "Z" in URDF. This is because of usd
-        files assuming Y axis as up while urdf files assume Z axis as up.
-
-        Args:
-            link_name (str): Name of link.
-            base (bool, optional): Is this the base link of the robot?
-
-        Returns:
-            LinkParams: Obtained link parameters.
+        Includes logic to detect flipped axes and apply joint_offset=[-1.0, 0.0],
+        similar to how UrdfKinematicsParser handles negative axes.
         """
         link_params = self._get_from_extra_links(link_name)
         if link_params is not None:
             return link_params
+
         joint_limits = None
-        joint_axis = None
+        joint_offset = [1.0, 0.0]  # Default: Multiplier 1.0, Offset 0.0
+
         if base:
             parent_link_name = None
             joint_transform = np.eye(4)
@@ -128,16 +125,76 @@ class UsdKinematicsParser(KinematicsParser):
             joint_transform = self._get_joint_transform(joint_prim)
             joint_axis = None
             joint_name = joint_prim.GetName()
+
+            # --- [Axis Flip Detection Logic] ---
+            # 1. Get Rot1 (Child -> Joint transform)
+            j_api = UsdPhysics.Joint(joint_prim)
+            quat1_gf = j_api.GetLocalRot1Attr().Get()
+
+            # 2. Get Defined Axis
+            raw_axis = "X"
+            if joint_prim.IsA(UsdPhysics.RevoluteJoint):
+                raw_axis = UsdPhysics.RevoluteJoint(joint_prim).GetAxisAttr().Get()
+            elif joint_prim.IsA(UsdPhysics.PrismaticJoint):
+                raw_axis = UsdPhysics.PrismaticJoint(joint_prim).GetAxisAttr().Get()
+
+            # 3. Create Axis Vector (Must be Vec3f)
+            axis_vec = Gf.Vec3f(0, 0, 0)
+            if raw_axis == "X":
+                axis_vec[0] = 1.0
+            elif raw_axis == "Y":
+                axis_vec[1] = 1.0
+            elif raw_axis == "Z":
+                axis_vec[2] = 1.0
+
+            # 4. Check alignment in Child Frame
+            transformed_axis = quat1_gf.GetInverse().Transform(axis_vec)
+
+            dot_product = 0.0
+            if raw_axis == "X":
+                dot_product = transformed_axis[0]
+            elif raw_axis == "Y":
+                dot_product = transformed_axis[1]
+            elif raw_axis == "Z":
+                dot_product = transformed_axis[2]
+
+            # Auto-detect flip (if dot product is negative)
+            is_flipped_auto = dot_product < -0.9
+
+            # Manual override check
+            is_flipped_manual = False
+            if isinstance(self._flip_joints, list):
+                is_flipped_manual = joint_name in self._flip_joints
+            elif isinstance(self._flip_joints, dict):
+                is_flipped_manual = joint_name in self._flip_joints.keys()
+
+            should_flip = is_flipped_auto or is_flipped_manual
+
+            # --- [Apply Flip via Offset] ---
+            if should_flip:
+                # Instead of rotating the frame, we invert the multiplier.
+                # This matches URDF parser logic for negative axes.
+                joint_offset[0] = -1.0
+
+            # --- [Joint Type Parsing] ---
             if joint_prim.IsA(UsdPhysics.FixedJoint):
                 joint_type = JointType.FIXED
+
             elif joint_prim.IsA(UsdPhysics.RevoluteJoint):
                 j_prim = UsdPhysics.RevoluteJoint(joint_prim)
-                joint_axis = j_prim.GetAxisAttr().Get()
-                joint_limits = np.radians(
-                    np.ravel([j_prim.GetLowerLimitAttr().Get(), j_prim.GetUpperLimitAttr().Get()])
-                )
-                if joint_name in self._flip_joints.keys():
-                    joint_axis = self._flip_joints[joint_name]
+                joint_axis = raw_axis
+
+                lower = j_prim.GetLowerLimitAttr().Get()
+                upper = j_prim.GetUpperLimitAttr().Get()
+
+                # If flipped, we should also swap limits for correctness
+                if should_flip:
+                    temp = lower
+                    lower = -upper
+                    upper = -temp
+
+                joint_limits = np.radians(np.ravel([lower, upper]))
+
                 if joint_axis == "X":
                     joint_type = JointType.X_ROT
                 elif joint_axis == "Y":
@@ -149,17 +206,21 @@ class UsdKinematicsParser(KinematicsParser):
 
             elif joint_prim.IsA(UsdPhysics.PrismaticJoint):
                 j_prim = UsdPhysics.PrismaticJoint(joint_prim)
+                joint_axis = raw_axis
 
-                joint_axis = j_prim.GetAxisAttr().Get()
-                joint_limits = np.ravel(
-                    [j_prim.GetLowerLimitAttr().Get(), j_prim.GetUpperLimitAttr().Get()]
-                )
-                if joint_name in self._flip_joints.keys():
-                    joint_axis = self._flip_joints[joint_name]
-                if joint_name in self._flip_joint_limits:
-                    joint_limits = np.ravel(
-                        [-1.0 * j_prim.GetUpperLimitAttr().Get(), j_prim.GetLowerLimitAttr().Get()]
-                    )
+                lower = j_prim.GetLowerLimitAttr().Get()
+                upper = j_prim.GetUpperLimitAttr().Get()
+
+                # Manual limit flip override + Auto flip
+                manual_limit_flip = joint_name in self._flip_joint_limits
+                if should_flip or manual_limit_flip:
+                    temp = lower
+                    lower = -upper
+                    upper = -temp
+
+                # Prismatic does NOT use radians
+                joint_limits = np.ravel([lower, upper])
+
                 if joint_axis == "X":
                     joint_type = JointType.X_PRISM
                 elif joint_axis == "Y":
@@ -169,7 +230,10 @@ class UsdKinematicsParser(KinematicsParser):
                 else:
                     log_error("Joint axis not supported" + str(joint_axis))
             else:
-                log_error("Joint type not supported")
+                # Default fallback or error
+                log_error(f"Joint type not supported: {joint_prim.GetTypeName()}")
+                joint_type = JointType.FIXED
+
         link_params = LinkParams(
             link_name=link_name,
             joint_name=joint_name,
@@ -177,6 +241,7 @@ class UsdKinematicsParser(KinematicsParser):
             fixed_transform=joint_transform,
             parent_link_name=parent_link_name,
             joint_limits=joint_limits,
+            joint_offset=joint_offset,  # Passed to CuRobo LinkParams
         )
         return link_params
 
@@ -197,7 +262,9 @@ class UsdKinematicsParser(KinematicsParser):
         quat[1:] = quatf.GetImaginary()
 
         # create a homogenous transformation matrix:
-        transform_0 = Pose(self.tensor_args.to_device(position), self.tensor_args.to_device(quat))
+        transform_0 = Pose(
+            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
+        )
 
         position = np.ravel(j_prim.GetLocalPos1Attr().Get())
         quatf = j_prim.GetLocalRot1Attr().Get()
@@ -206,9 +273,15 @@ class UsdKinematicsParser(KinematicsParser):
         quat[1:] = quatf.GetImaginary()
 
         # create a homogenous transformation matrix:
-        transform_1 = Pose(self.tensor_args.to_device(position), self.tensor_args.to_device(quat))
+        transform_1 = Pose(
+            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
+        )
         transform = (
-            transform_0.multiply(transform_1.inverse()).get_matrix().cpu().view(4, 4).numpy()
+            transform_0.multiply(transform_1.inverse())
+            .get_matrix()
+            .cpu()
+            .view(4, 4)
+            .numpy()
         )
 
         # get attached link transform:
@@ -216,7 +289,9 @@ class UsdKinematicsParser(KinematicsParser):
         return transform
 
 
-def get_links_for_joint(prim: Usd.Prim) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
+def get_links_for_joint(
+    prim: Usd.Prim,
+) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
     """Get all link prims from the given joint prim.
 
 
