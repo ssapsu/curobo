@@ -83,6 +83,13 @@ class UsdKinematicsParser(KinematicsParser):
         """Root prim of the robot in the Usd Stage."""
         return self._usd_robot_root
 
+    def _is_excluded_from_articulation(self, joint_prim: Usd.Prim) -> bool:
+        try:
+            v = UsdPhysics.Joint(joint_prim).GetExcludeFromArticulationAttr().Get()
+            return bool(v) if v is not None else False
+        except Exception:
+            return False
+
     def build_link_parent(self):
         """Build a dictionary containing parent link for each link in the robot."""
         self._parent_map = {}
@@ -93,8 +100,14 @@ class UsdKinematicsParser(KinematicsParser):
                 x.IsA(UsdPhysics.Joint)
                 and str(x.GetPath()).startswith(self._usd_robot_root)
             )
+            if (
+                x.IsA(UsdPhysics.Joint)
+                and str(x.GetPath()).startswith(self._usd_robot_root)
+            )
         ]
         for l in all_joints:
+            if self._is_excluded_from_articulation(l):
+                continue
             parent, child = get_links_for_joint(l)
             if child is not None and parent is not None:
                 self._parent_map[child.GetName()] = {"parent": parent.GetName()}
@@ -182,19 +195,17 @@ class UsdKinematicsParser(KinematicsParser):
 
             elif joint_prim.IsA(UsdPhysics.RevoluteJoint):
                 j_prim = UsdPhysics.RevoluteJoint(joint_prim)
-                joint_axis = raw_axis
-
-                lower = j_prim.GetLowerLimitAttr().Get()
-                upper = j_prim.GetUpperLimitAttr().Get()
-
-                # If flipped, we should also swap limits for correctness
-                if should_flip:
-                    temp = lower
-                    lower = -upper
-                    upper = -temp
-
-                joint_limits = np.radians(np.ravel([lower, upper]))
-
+                joint_axis = j_prim.GetAxisAttr().Get()
+                joint_limits = np.radians(
+                    np.ravel(
+                        [
+                            j_prim.GetLowerLimitAttr().Get(),
+                            j_prim.GetUpperLimitAttr().Get(),
+                        ]
+                    )
+                )
+                if joint_name in self._flip_joints.keys():
+                    joint_axis = self._flip_joints[joint_name]
                 if joint_axis == "X":
                     joint_type = JointType.X_ROT
                 elif joint_axis == "Y":
@@ -206,21 +217,20 @@ class UsdKinematicsParser(KinematicsParser):
 
             elif joint_prim.IsA(UsdPhysics.PrismaticJoint):
                 j_prim = UsdPhysics.PrismaticJoint(joint_prim)
-                joint_axis = raw_axis
 
-                lower = j_prim.GetLowerLimitAttr().Get()
-                upper = j_prim.GetUpperLimitAttr().Get()
-
-                # Manual limit flip override + Auto flip
-                manual_limit_flip = joint_name in self._flip_joint_limits
-                if should_flip or manual_limit_flip:
-                    temp = lower
-                    lower = -upper
-                    upper = -temp
-
-                # Prismatic does NOT use radians
-                joint_limits = np.ravel([lower, upper])
-
+                joint_axis = j_prim.GetAxisAttr().Get()
+                joint_limits = np.ravel(
+                    [j_prim.GetLowerLimitAttr().Get(), j_prim.GetUpperLimitAttr().Get()]
+                )
+                if joint_name in self._flip_joints.keys():
+                    joint_axis = self._flip_joints[joint_name]
+                if joint_name in self._flip_joint_limits:
+                    joint_limits = np.ravel(
+                        [
+                            -1.0 * j_prim.GetUpperLimitAttr().Get(),
+                            j_prim.GetLowerLimitAttr().Get(),
+                        ]
+                    )
                 if joint_axis == "X":
                     joint_type = JointType.X_PRISM
                 elif joint_axis == "Y":
@@ -265,6 +275,9 @@ class UsdKinematicsParser(KinematicsParser):
         transform_0 = Pose(
             self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
         )
+        transform_0 = Pose(
+            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
+        )
 
         position = np.ravel(j_prim.GetLocalPos1Attr().Get())
         quatf = j_prim.GetLocalRot1Attr().Get()
@@ -276,7 +289,15 @@ class UsdKinematicsParser(KinematicsParser):
         transform_1 = Pose(
             self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
         )
+        transform_1 = Pose(
+            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
+        )
         transform = (
+            transform_0.multiply(transform_1.inverse())
+            .get_matrix()
+            .cpu()
+            .view(4, 4)
+            .numpy()
             transform_0.multiply(transform_1.inverse())
             .get_matrix()
             .cpu()
@@ -289,6 +310,9 @@ class UsdKinematicsParser(KinematicsParser):
         return transform
 
 
+def get_links_for_joint(
+    prim: Usd.Prim,
+) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
 def get_links_for_joint(
     prim: Usd.Prim,
 ) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
