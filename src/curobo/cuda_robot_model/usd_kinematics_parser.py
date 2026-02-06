@@ -100,10 +100,6 @@ class UsdKinematicsParser(KinematicsParser):
                 x.IsA(UsdPhysics.Joint)
                 and str(x.GetPath()).startswith(self._usd_robot_root)
             )
-            if (
-                x.IsA(UsdPhysics.Joint)
-                and str(x.GetPath()).startswith(self._usd_robot_root)
-            )
         ]
         for l in all_joints:
             if self._is_excluded_from_articulation(l):
@@ -275,9 +271,6 @@ class UsdKinematicsParser(KinematicsParser):
         transform_0 = Pose(
             self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
         )
-        transform_0 = Pose(
-            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
-        )
 
         position = np.ravel(j_prim.GetLocalPos1Attr().Get())
         quatf = j_prim.GetLocalRot1Attr().Get()
@@ -289,15 +282,7 @@ class UsdKinematicsParser(KinematicsParser):
         transform_1 = Pose(
             self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
         )
-        transform_1 = Pose(
-            self.tensor_args.to_device(position), self.tensor_args.to_device(quat)
-        )
         transform = (
-            transform_0.multiply(transform_1.inverse())
-            .get_matrix()
-            .cpu()
-            .view(4, 4)
-            .numpy()
             transform_0.multiply(transform_1.inverse())
             .get_matrix()
             .cpu()
@@ -310,9 +295,6 @@ class UsdKinematicsParser(KinematicsParser):
         return transform
 
 
-def get_links_for_joint(
-    prim: Usd.Prim,
-) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
 def get_links_for_joint(
     prim: Usd.Prim,
 ) -> Tuple[Optional[Usd.Prim], Optional[Usd.Prim]]:
